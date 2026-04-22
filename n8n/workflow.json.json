@@ -1,0 +1,466 @@
+{
+  "name": "dataset_analyzer",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "binaryPropertyName": "Dataset",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        32
+      ],
+      "id": "a5c7bb00-6492-464d-a363-b21e79941865",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────\n// 0. RÉCUPÉRATION DES DONNÉES\n// ─────────────────────────────\n\nconst df = $input.all().map(i => i.json);\nconst n = df.length;\nconst issues = [];\n\n// Récupération du nom du dataset depuis un autre noeud\nconst dataset_name = $('Extract Dataset Name').first().json.Dataset[0].filename;\n\nif (n === 0) {\n  return [{ json: { message: \"Dataset vide\" } }];\n}\n\nconst columns = Object.keys(df[0]);\n\n// ─────────────────────────────\n// FONCTIONS UTILITAIRES\n// ─────────────────────────────\n\nfunction pct(nb, total) {\n  return total > 0 ? parseFloat(((nb / total) * 100).toFixed(1)) : 0;\n}\n\nfunction isEmpty(v) {\n  return v === null || v === undefined || v === \"\";\n}\n\nfunction flag(critere, regle, nb, type = \"ANOMALIE\", details = \"\") {\n  issues.push({\n    dataset_name,\n    critere,\n    regle,\n    statut: nb === 0 ? \"OK\" : type === \"BLOQUANT\" ? \"❌ BLOQUANT\" : \"⚠ ANOMALIE\",\n    nb,\n    pct: pct(nb, n),\n    details,\n  });\n}\n\n// ─────────────────────────────\n// 1. STRUCTURE\n// ─────────────────────────────\n\nflag(\"Structure\", \"Dataset vide\", n === 0 ? 1 : 0, \"BLOQUANT\");\n\n// ─────────────────────────────\n// 2. COMPLETUDE\n// ─────────────────────────────\n\nlet totalEmpty = 0;\n\ncolumns.forEach(col => {\n  const empty = df.filter(r => isEmpty(r[col])).length;\n  totalEmpty += empty;\n  flag(\"Complétude\", `${col} valeurs nulles`, empty);\n});\n\nissues.push({\n  dataset_name,\n  critere: \"Complétude\",\n  regle: \"Total cellules vides\",\n  statut: totalEmpty === 0 ? \"OK\" : \"⚠ ANOMALIE\",\n  nb: totalEmpty,\n  pct: pct(totalEmpty, n * columns.length),\n});\n\n// ─────────────────────────────\n// 3. DOUBLONS\n// ─────────────────────────────\n\nconst seen = new Set();\nlet duplicates = 0;\n\ndf.forEach(row => {\n  const key = JSON.stringify(row);\n  if (seen.has(key)) duplicates++;\n  else seen.add(key);\n});\n\nflag(\"Doublons\", \"Lignes dupliquées\", duplicates);\n\n// ─────────────────────────────\n// 4. TYPAGE\n// ─────────────────────────────\n\ncolumns.forEach(col => {\n  const types = new Set();\n\n  df.forEach(r => {\n    const val = r[col];\n    if (!isEmpty(val)) types.add(typeof val);\n  });\n\n  if (types.size > 1) {\n    issues.push({\n      dataset_name,\n      critere: \"Typage\",\n      regle: `${col} types incohérents`,\n      statut: \"⚠ ANOMALIE\",\n      details: Array.from(types).join(\", \"),\n    });\n  }\n});\n\n// ─────────────────────────────\n// 5. VALEURS NUMERIQUES\n// ─────────────────────────────\n\ncolumns.forEach(col => {\n  const values = df.map(r => r[col]).filter(v => !isEmpty(v));\n  const numeric = values.filter(v => !isNaN(v));\n\n  if (numeric.length > 0) {\n    const negatives = numeric.filter(v => Number(v) < 0).length;\n    flag(\"Valeurs\", `${col} valeurs négatives`, negatives);\n  }\n});\n\n// ─────────────────────────────\n// 6. COLONNES CONSTANTES\n// ─────────────────────────────\n\ncolumns.forEach(col => {\n  const unique = new Set(df.map(r => r[col]));\n  if (unique.size === 1) {\n    issues.push({\n      dataset_name,\n      critere: \"Qualité\",\n      regle: `${col} constante`,\n      statut: \"⚠ ANOMALIE\",\n      nb: 0,\n      pct: 0,\n      details: \"\",\n    });\n  }\n});\n\n// ─────────────────────────────\n// 7. OUTLIERS\n// ─────────────────────────────\n\ncolumns.forEach(col => {\n  const nums = df.map(r => Number(r[col])).filter(v => !isNaN(v));\n\n  if (nums.length > 10) {\n    const mean = nums.reduce((a, b) => a + b, 0) / nums.length;\n    const std = Math.sqrt(\n      nums.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / nums.length\n    );\n\n    const outliers = nums.filter(v => Math.abs(v - mean) > 3 * std).length;\n    flag(\"Outliers\", `${col} valeurs aberrantes`, outliers);\n  }\n});\n\n// ─────────────────────────────\n// 8. SCORE + CONFIANCE\n// ─────────────────────────────\n\nconst anomalies = issues.filter(i => i.statut.includes(\"ANOMALIE\")).length;\nconst bloquants = issues.filter(i => i.statut.includes(\"BLOQUANT\")).length;\nconst totalChecks = issues.length;\n\nconst score = 100\n  - (anomalies / totalChecks) * 50\n  - (bloquants / totalChecks) * 50;\n\nconst finalScore = Math.max(0, Math.round(score));\n\nlet confiance = \"\";\nif (finalScore >= 80) confiance = \"🟢 Élevée\";\nelse if (finalScore >= 60) confiance = \"🟡 Moyenne\";\nelse confiance = \"🔴 Faible\";\n\n// ─────────────────────────────\n// OUTPUT FINAL\n// ─────────────────────────────\n\nreturn [\n  {\n    json: {\n      dataset_name,\n      total_rows: n,\n      total_columns: columns.length,\n      anomalies,\n      bloquants,\n      score: finalScore,\n      confiance,\n      issues,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        992,
+        32
+      ],
+      "id": "f62a6de6-c194-4a23-8425-c33346ef7c9d",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "formTitle": "Dataset",
+        "formDescription": "Importer le dataset",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Dataset",
+              "fieldType": "file"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.5,
+      "position": [
+        272,
+        32
+      ],
+      "id": "0114d53f-d3a6-46e2-b987-e98acca9281e",
+      "name": "Upload Dataset",
+      "webhookId": "c30e8166-dda7-4b8a-b232-a5bb3f28b59b"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a49c5232-519b-460e-accd-563e26538df6",
+              "name": "dataset_name",
+              "value": "={{$binary.Dataset.fileName}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        480,
+        32
+      ],
+      "id": "d96f4e0f-8c66-47cf-b3ec-f27243604985",
+      "name": "Extract Dataset Name"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "data_quality",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "score": "={{$json.score}}",
+            "anomalies": "={{$json.anomalies}}",
+            "bloquants": "={{$json.bloquants}}",
+            "date_run": "={{$now}}",
+            "confiance": "={{$json.confiance}}",
+            "dataset_name": "={{$json.dataset_name}}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "date_run",
+              "displayName": "date_run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "dataset_name",
+              "displayName": "dataset_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "anomalies",
+              "displayName": "anomalies",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "bloquants",
+              "displayName": "bloquants",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "confiance",
+              "displayName": "confiance",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1312,
+        224
+      ],
+      "id": "c3fa6b6f-fafb-4a30-a03e-c0919ea8780c",
+      "name": "Save Global Score",
+      "credentials": {
+        "postgres": {
+          "id": "Eg9ZFm9uKJyC2k7X",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "issues",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1312,
+        -112
+      ],
+      "id": "23358aa9-5c0b-4356-9737-782d24506134",
+      "name": "Split Issues"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5578021e-ced4-4f6a-b819-747bdb0add73",
+              "name": "dataset_name",
+              "value": "={{$json.dataset_name}}",
+              "type": "string"
+            },
+            {
+              "id": "b1612f61-ba07-453a-8bcf-edf403badf29",
+              "name": "={{$json.dataset_name || \"dataset_test\"}}",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1584,
+        -112
+      ],
+      "id": "28eaa23a-3b16-4094-8ebb-50dee382d277",
+      "name": "Format Issues Data"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "data_quality_issues",
+          "mode": "list",
+          "cachedResultName": "data_quality_issues"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "nb": "={{$json.nb}}",
+            "dataset_name": "={{$json.dataset_name}}",
+            "date_run": "={{$now}}",
+            "critere": "={{$json.critere}}",
+            "regle": "={{$json.regle}}",
+            "statut": "={{$json.statut}}",
+            "pct": "={{$json.pct}}",
+            "details": "={{$json.details}}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "dataset_name",
+              "displayName": "dataset_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "date_run",
+              "displayName": "date_run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "critere",
+              "displayName": "critere",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "regle",
+              "displayName": "regle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "statut",
+              "displayName": "statut",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nb",
+              "displayName": "nb",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pct",
+              "displayName": "pct",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "details",
+              "displayName": "details",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1792,
+        -112
+      ],
+      "id": "65667d69-b932-4d17-9d22-dc8b0220d97c",
+      "name": "Save Issues",
+      "credentials": {
+        "postgres": {
+          "id": "Eg9ZFm9uKJyC2k7X",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Save Global Score",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Split Issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Dataset": {
+      "main": [
+        [
+          {
+            "node": "Extract Dataset Name",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Dataset Name": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Global Score": {
+      "main": [
+        []
+      ]
+    },
+    "Split Issues": {
+      "main": [
+        [
+          {
+            "node": "Format Issues Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Issues Data": {
+      "main": [
+        [
+          {
+            "node": "Save Issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "bb3ef647-58a3-427f-8bdf-f15a3d05a864",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a10e08b8c0a7206237880ac717296a55764293d3029519ccd8bed83b4f83ff16"
+  },
+  "id": "9_x7glXXvQkMpxYxyzIZj",
+  "tags": []
+}
